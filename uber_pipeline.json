@@ -1,0 +1,134 @@
+{
+  "components": {
+    "comp-extract-and-process": {
+      "executorLabel": "exec-extract-and-process",
+      "outputDefinitions": {
+        "artifacts": {
+          "output_data": {
+            "artifactType": {
+              "schemaTitle": "system.Dataset",
+              "schemaVersion": "0.0.1"
+            }
+          }
+        }
+      }
+    },
+    "comp-train-model": {
+      "executorLabel": "exec-train-model",
+      "inputDefinitions": {
+        "artifacts": {
+          "input_data": {
+            "artifactType": {
+              "schemaTitle": "system.Dataset",
+              "schemaVersion": "0.0.1"
+            }
+          }
+        }
+      },
+      "outputDefinitions": {
+        "artifacts": {
+          "model_output": {
+            "artifactType": {
+              "schemaTitle": "system.Model",
+              "schemaVersion": "0.0.1"
+            }
+          }
+        }
+      }
+    }
+  },
+  "deploymentSpec": {
+    "executors": {
+      "exec-extract-and-process": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "extract_and_process"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&  python3 -m pip install --quiet --no-warn-script-location 'google-cloud-bigquery' 'pandas' 'shapely' 'pyproj' 'pyarrow' 'db-dtypes' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef extract_and_process(output_data: Output[Dataset]):\n    import os\n    import pandas as pd\n    from shapely import wkt\n    from shapely.geometry import Polygon\n\n    from google.cloud import bigquery\n    bq = bigquery.Client(project=\"first-gcp-project-348710\")\n\n    query = \"\"\"\n    SELECT \n        hexid,\n        dayType,\n        traversals,\n        wktGeometry\n    FROM `first-gcp-project-348710.uber_sf.ride_prices`\n    WHERE traversals IS NOT NULL\n    \"\"\"\n\n    df = bq.query(query).to_dataframe()\n\n    # Convert WKT to centroid lat/lng\n    def extract_centroid_lat_lng(wkt_str):\n        try:\n            polygon = wkt.loads(wkt_str)\n            centroid = polygon.centroid\n            return pd.Series([centroid.y, centroid.x])\n        except:\n            return pd.Series([None, None])\n\n    df[[\"lat\", \"lng\"]] = df[\"wktGeometry\"].apply(extract_centroid_lat_lng)\n    df.drop(columns=[\"wktGeometry\"], inplace=True)\n\n    # Optionally simulate price as a label\n    df[\"price\"] = df[\"traversals\"] * 0.8 + 2  # simple dummy label\n\n    output_path = output_data.path + \"/processed.csv\"\n    os.makedirs(output_data.path, exist_ok=True)\n    df.to_csv(output_path, index=False)\n\n"
+          ],
+          "image": "python:3.12"
+        }
+      },
+      "exec-train-model": {
+        "container": {
+          "args": [
+            "--executor_input",
+            "{{$}}",
+            "--function_to_execute",
+            "train_model"
+          ],
+          "command": [
+            "sh",
+            "-c",
+            "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location 'kfp==2.7.0' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&  python3 -m pip install --quiet --no-warn-script-location 'tensorflow' 'pandas' 'scikit-learn' && \"$0\" \"$@\"\n",
+            "sh",
+            "-ec",
+            "program_path=$(mktemp -d)\n\nprintf \"%s\" \"$0\" > \"$program_path/ephemeral_component.py\"\n_KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         \"$program_path/ephemeral_component.py\"                         \"$@\"\n",
+            "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import *\n\ndef train_model(input_data: Input[Dataset], model_output: Output[Model]):\n    import pandas as pd\n    import os\n    from tensorflow import keras\n    from tensorflow.keras import layers\n    import numpy as np\n    from sklearn.preprocessing import StandardScaler\n    from sklearn.model_selection import train_test_split\n\n    # Enable mixed precision training\n    # keras.mixed_precision.set_global_policy('mixed_float16')\n\n    # Read data in chunks to reduce memory usage\n    chunk_size = 50000  # Increased chunk size for faster processing\n    chunks = pd.read_csv(input_data.path + \"/processed.csv\", chunksize=chunk_size)\n\n    # Process first chunk to get feature names and initialize scalers\n    first_chunk = next(chunks)\n    first_chunk = first_chunk.dropna()\n\n    # Define feature groups\n    categorical_cols = [\"hexid\", \"dayType\"]\n    numerical_cols = [\"traversals\", \"lat\", \"lng\"]\n    target_col = \"price\"\n\n    # Initialize scaler for numerical features\n    scaler = StandardScaler()\n    scaler.fit(first_chunk[numerical_cols])\n\n    # One-hot encode the first chunk to get the expected columns\n    first_chunk_encoded = pd.get_dummies(first_chunk.drop(columns=[target_col]), columns=categorical_cols)\n    expected_columns = first_chunk_encoded.columns\n\n    # Initialize model with simplified architecture\n    model = keras.Sequential([\n        layers.Input(shape=(len(expected_columns),)),\n        layers.BatchNormalization(),\n        layers.Dense(64, activation='relu'),\n        layers.Dropout(0.1),\n        layers.Dense(32, activation='relu'),\n        layers.Dense(1)\n    ])\n\n    # Use Huber loss which is more robust to outliers\n    model.compile(\n        optimizer=keras.optimizers.Adam(learning_rate=0.001),\n        loss='huber',\n        metrics=['mae']\n    )\n\n    # Prepare validation data from first chunk\n    X_val = first_chunk.drop(columns=[target_col])\n    X_val = pd.get_dummies(X_val, columns=categorical_cols)\n    for col in expected_columns:\n        if col not in X_val.columns:\n            X_val[col] = 0\n    X_val = X_val[expected_columns]\n    X_val[numerical_cols] = scaler.transform(X_val[numerical_cols])\n    X_val = X_val.astype(np.float32)\n    y_val = first_chunk[target_col].values.astype(np.float32)\n\n    # Train on chunks\n    for chunk in chunks:\n        chunk = chunk.dropna()\n        y = chunk[target_col].values.astype(np.float32)\n        X = chunk.drop(columns=[target_col])\n\n        # Scale numerical features\n        X[numerical_cols] = scaler.transform(X[numerical_cols])\n\n        # One-hot encode categorical columns\n        X = pd.get_dummies(X, columns=categorical_cols)\n\n        # Ensure consistent columns with first chunk\n        for col in expected_columns:\n            if col not in X.columns:\n                X[col] = 0\n        X = X[expected_columns]\n\n        # Convert all columns to float32\n        X = X.astype(np.float32)\n\n        # Convert to numpy and train\n        X = X.to_numpy()\n        model.fit(\n            X, y,\n            epochs=1,\n            batch_size=128,  # Increased batch size\n            validation_data=(X_val, y_val),\n            verbose=0\n        )\n\n    # Save the model and scaler\n    os.makedirs(model_output.path, exist_ok=True)\n    model.export(model_output.path)\n\n    # Save the scaler parameters\n    scaler_params = {\n        'mean_': scaler.mean_,\n        'scale_': scaler.scale_,\n        'feature_names': numerical_cols\n    }\n    np.save(os.path.join(model_output.path, \"scaler_params.npy\"), scaler_params)\n\n    with open(os.path.join(model_output.path, \"expected_columns.txt\"), \"w\") as f:\n        f.write(\"\\n\".join(expected_columns))\n\n"
+          ],
+          "image": "python:3.12",
+          "resources": {
+            "cpuLimit": 16.0,
+            "memoryLimit": 128.0
+          }
+        }
+      }
+    }
+  },
+  "pipelineInfo": {
+    "name": "uber-price-prediction-pipeline"
+  },
+  "root": {
+    "dag": {
+      "tasks": {
+        "extract-and-process": {
+          "cachingOptions": {
+            "enableCache": true
+          },
+          "componentRef": {
+            "name": "comp-extract-and-process"
+          },
+          "taskInfo": {
+            "name": "extract-and-process"
+          }
+        },
+        "train-model": {
+          "cachingOptions": {
+            "enableCache": true
+          },
+          "componentRef": {
+            "name": "comp-train-model"
+          },
+          "dependentTasks": [
+            "extract-and-process"
+          ],
+          "inputs": {
+            "artifacts": {
+              "input_data": {
+                "taskOutputArtifact": {
+                  "outputArtifactKey": "output_data",
+                  "producerTask": "extract-and-process"
+                }
+              }
+            }
+          },
+          "taskInfo": {
+            "name": "train-model"
+          }
+        }
+      }
+    }
+  },
+  "schemaVersion": "2.1.0",
+  "sdkVersion": "kfp-2.7.0"
+}
